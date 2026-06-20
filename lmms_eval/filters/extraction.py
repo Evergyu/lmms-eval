@@ -3,6 +3,30 @@ import sys
 import unicodedata
 
 from lmms_eval.api.filter import Filter
+from lmms_eval.api.registry import register_filter
+
+_ANS_LEAD = re.compile(r'^[\s\(\[\{\'\"`]+')
+# %는 제외 — 일부 벤치(infovqa 등)는 정답에 %가 의미있게 붙음(벤치별 정답분석 결과).
+_ANS_TRAIL = re.compile(r'[\s\.\,\;\:\!\?\)\]\}\'\"`。]+$')
+
+
+@register_filter("answer_normalize")
+class AnswerNormalizeFilter(Filter):
+    """ANLS류 단답 정규화(전 모델 동일 적용): 앞뒤 구두점·괄호·따옴표 제거(정답에 거의 없음 → 안전)
+    + 정수 실수 정규화(12.0 -> 12). %·단위는 정답에 의미있게 붙어 보존. 메트릭은 안 건드림."""
+
+    def __init__(self, **kwargs) -> None:
+        pass
+
+    def apply(self, resps, docs):
+        def norm(s):
+            s = _ANS_TRAIL.sub('', _ANS_LEAD.sub('', str(s)))
+            try:
+                f = float(s.replace(',', ''))
+                return str(int(f)) if f == int(f) else ("%g" % f)
+            except Exception:
+                return s
+        return [[norm(r) for r in inst] for inst in resps]
 
 
 class WhitespaceFilter(Filter):

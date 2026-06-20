@@ -277,13 +277,20 @@ class EvaluationTracker:
                     if isinstance(sample["filtered_resps"], list) and len(sample["filtered_resps"]) == 1:
                         sample["filtered_resps"] = sample["filtered_resps"][0]
 
-                    if sample["resps"] == sample["filtered_resps"]:
-                        sample.pop("resps")
-                    elif isinstance(sample["resps"], list) and len(sample["resps"]) == 1 and sample["resps"][0] == sample["filtered_resps"]:
-                        sample.pop("resps")
+                    # LMMS_LOG_FULL=1 keeps the raw generation, full doc (real gold for tasks
+                    # whose doc_to_target is a placeholder) and arguments — needed to audit
+                    # scoring / compare answers. Default (unset) = original reduced logging,
+                    # so existing run dirs (e.g. vllm/) are byte-identical and untouched.
+                    _log_full = bool(os.environ.get("LMMS_LOG_FULL"))
+                    if not _log_full:
+                        if sample["resps"] == sample["filtered_resps"]:
+                            sample.pop("resps")
+                        elif isinstance(sample["resps"], list) and len(sample["resps"]) == 1 and sample["resps"][0] == sample["filtered_resps"]:
+                            sample.pop("resps")
                     sample["target"] = str(sample["target"])
-                    sample.pop("arguments")
-                    sample.pop("doc")
+                    if not _log_full:
+                        sample.pop("arguments")
+                        sample.pop("doc")
 
                     sample_dump = (
                         json.dumps(

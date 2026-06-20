@@ -1,4 +1,5 @@
-dataset_path: lmms-lab/ChartQAPro
+# 원래 dataset_path였던 lmms-lab/ChartQAPro는 HF 허브에 존재하지 않음 → 공식(논문 저자) 데이터셋으로 교체
+dataset_path: ahmed-masry/ChartQAPro
 dataset_kwargs:
   token: True
 task: "chartqapro"
@@ -6,9 +7,9 @@ test_split: test
 output_type: generate_until
 doc_to_visual: !function utils.chartqapro_doc_to_visual
 doc_to_text: !function utils.chartqapro_doc_to_text
-doc_to_target: "answer"
+doc_to_target: "Answer"   # 데이터셋 실제 필드명 (소문자 'answer' 필드는 없음)
 generation_kwargs:
-  max_new_tokens: 16
+  max_new_tokens: 64   # 복수 답(['A','B'] 형식)·구 단위 답이 있어 16으로는 잘림
   temperature: 0
   do_sample: False
 process_results: !function utils.chartqapro_process_results
