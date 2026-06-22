@@ -191,7 +191,18 @@ class InternVL3_5_KTH(InternVL3):
         self._SamplingParams = SamplingParams
 
         # Extract the Qwen3 decoder once per checkpoint and load it into vLLM.
-        tmp_dir = os.path.join(tempfile.gettempdir(), "internvl_kth_qwen3_" + str(abs(hash(pretrained)) % 10**8))
+        # Cache the extracted decoder on DISK, never /tmp: on this host /tmp is
+        # tmpfs (RAM), so dumping a ~14GB decoder per checkpoint across a sweep
+        # exhausts memory. Key by absolute checkpoint path with a stable digest
+        # (builtin hash() is salted per process -> would re-extract every run and
+        # pile up). Reused across runs; override location with KTH_LLM_CACHE_DIR.
+        import hashlib
+
+        cache_root = os.environ.get("KTH_LLM_CACHE_DIR") or os.path.join(
+            os.path.expanduser("~"), ".cache", "internvl_kth_qwen3"
+        )
+        key = hashlib.md5(os.path.abspath(pretrained).encode()).hexdigest()[:12]
+        tmp_dir = os.path.join(cache_root, f"qwen3_{key}")
         if not os.path.exists(os.path.join(tmp_dir, "model.safetensors.index.json")):
             _extract_qwen3_llm(pretrained, tmp_dir)
         self._vllm = LLM(
