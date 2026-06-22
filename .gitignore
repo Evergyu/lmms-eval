@@ -85,3 +85,4 @@ Bagel/
 MMaDA/
 .codex
 lmms_eval/tasks/hd_epic/hd_epic_questions.jsonl
+lmms_eval/tasks/prismm_bench/pdf_cache/

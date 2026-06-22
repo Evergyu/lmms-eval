@@ -31,11 +31,30 @@ def concat_images(images, column_num=3):
     return concatenated_image
 
 
+import os as _os
+
+# HF 데이터셋(daluggas/PRISMM-Bench)은 384행 중 180행의 pdf가 비어 있음.
+# 논문은 384행 전체를 page/document context로 평가하므로, 빠진 PDF는
+# OpenReview(https://openreview.net/pdf?id=<paper_id>)에서 받아 여기 캐시에 둠.
+# 채우는 방법: uid 앞부분(paper_id)으로 pdf_cache/<paper_id>.pdf 저장.
+PDF_CACHE_DIR = _os.environ.get("PRISMM_PDF_DIR", _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "pdf_cache"))
+
+
+def _local_pdf_path(doc):
+    uid = doc.get("uid", "")
+    paper_id = uid.rsplit("_", 1)[0] if uid else ""
+    return _os.path.join(PDF_CACHE_DIR, f"{paper_id}.pdf") if paper_id else ""
+
+
 def get_pdf_bytes(doc):
     pdf_data = doc.get("pdf")
-    if pdf_data is None:
-        raise ValueError("PDF data not found in document")
-    return pdf_data.stream.getvalue()
+    if pdf_data is not None:
+        return pdf_data.stream.getvalue()
+    local = _local_pdf_path(doc)
+    if local and _os.path.isfile(local):
+        with open(local, "rb") as f:
+            return f.read()
+    raise ValueError("PDF data not found in document")
 
 
 def prismm_doc_to_visual(doc):
@@ -494,3 +513,27 @@ def prismm_pair_match_process_results(doc, results):
         return {"exact_match": 1.0}
 
     return {"exact_match": 0.0}
+
+
+def prismm_filter_has_pdf(dataset):
+    """whole_doc/whole_page 변형용: PDF를 구할 수 있는 행만 남김.
+
+    데이터셋에 pdf가 있거나(204행) OpenReview에서 받아둔 로컬 캐시(pdf_cache/)에
+    있으면 유지. 캐시가 다 채워져 있으면 384행 전체가 유지되어 논문 설정과 일치.
+    어느 쪽에도 없는 행만 제외 (안 하면 get_pdf_bytes ValueError로 task 전체가 죽음).
+    decode=False 캐스팅으로 PDF 디코딩 없이 빠르게 스캔.
+    """
+    from datasets.features.pdf import Pdf
+    from loguru import logger
+
+    undecoded = dataset.cast_column("pdf", Pdf(decode=False))
+    keep = []
+    for i, row in enumerate(undecoded):
+        in_ds = row["pdf"] is not None and (row["pdf"].get("bytes") is not None or row["pdf"].get("path"))
+        local = _local_pdf_path(row)
+        if in_ds or (local and _os.path.isfile(local)):
+            keep.append(i)
+    dropped = len(undecoded) - len(keep)
+    if dropped:
+        logger.warning(f"prismm_bench whole_*: PDF를 구할 수 없는 {dropped}행 제외 ({len(keep)}/{len(undecoded)}행 평가). pdf_cache를 채우면 전체 평가 가능: {PDF_CACHE_DIR}")
+    return dataset.select(keep)

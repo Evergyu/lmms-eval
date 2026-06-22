@@ -1,6 +1,7 @@
 include: _default_template_yaml
 
 task: "prismm_bench_identification_whole_page"
+process_docs: !function utils.prismm_filter_has_pdf   # pdf 없는 180행 제외 (없으면 전체 task가 죽음)
 doc_to_visual: !function utils.prismm_doc_to_visual_whole_page
 doc_to_text: !function utils.prismm_doc_to_text
 doc_to_target: "answer"
