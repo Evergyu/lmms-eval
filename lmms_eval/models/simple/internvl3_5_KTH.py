@@ -55,6 +55,7 @@ import os
 import tempfile
 
 import torch
+from tqdm import tqdm
 
 from lmms_eval.api.registry import register_model
 from lmms_eval.models.simple.internvl3 import InternVL3
@@ -167,10 +168,19 @@ class InternVL3_5_KTH(InternVL3):
         pretrained: str = "OpenGVLab/InternVL3_5-8B",
         llm_gpu_memory_utilization: float = 0.4,
         llm_max_model_len: int = 12288,
+        gen_batch: int = 1,
         **kwargs,
     ):
         # Some lmms-eval task utils import OpenAI clients at module load time.
         os.environ.setdefault("OPENAI_API_KEY", "sk-dummy-offline")
+
+        # gen_batch: how many single-image / text-only requests to decode together
+        # through vLLM's continuous batching (max_num_seqs). 1 = original strictly
+        # sequential path (bit-exact HF reproduction). >1 fills the GPU but, since
+        # vLLM is not batch-invariant, may shift a few near-tie answers — re-baseline
+        # at the chosen value. Multi-image requests always fall back to the 1-by-1
+        # path. Env GEN_BATCH overrides the model_args value.
+        self._gen_batch = max(1, int(os.environ.get("GEN_BATCH", gen_batch)))
 
         # Patch transformers BEFORE the HF model is constructed in super().__init__.
         _apply_tf_compat_patches(pretrained)
@@ -189,7 +199,7 @@ class InternVL3_5_KTH(InternVL3):
             trust_remote_code=True,
             gpu_memory_utilization=float(llm_gpu_memory_utilization),
             max_model_len=int(llm_max_model_len),
-            max_num_seqs=1,
+            max_num_seqs=self._gen_batch,
             dtype="bfloat16",
             enable_prompt_embeds=True,
             enforce_eager=True,
@@ -220,11 +230,21 @@ class InternVL3_5_KTH(InternVL3):
             )
             sampling = SamplingParams(temperature=0.0, max_tokens=int(max_new_tokens))
 
-            sequences = []
+            # Build one prompt-embeds entry per batch row. batch_chat left-pads, so
+            # drop padding positions via attention_mask before handing the real
+            # prompt embeddings to vLLM (a single image-free row also passes its
+            # full sequence here, since its mask is all ones).
+            prompts = []
             for i in range(inputs_embeds.shape[0]):
-                emb = inputs_embeds[i].to(torch.bfloat16).contiguous()
-                out = vllm_engine.generate({"prompt_embeds": emb}, sampling)
-                sequences.append(list(out[0].outputs[0].token_ids))
+                emb = inputs_embeds[i]
+                if attention_mask is not None:
+                    emb = emb[attention_mask[i].bool()]
+                prompts.append({"prompt_embeds": emb.to(torch.bfloat16).contiguous()})
+
+            # One generate() call -> vLLM continuous-batches the whole list and
+            # returns outputs in input order.
+            outs = vllm_engine.generate(prompts, sampling)
+            sequences = [list(o.outputs[0].token_ids) for o in outs]
 
             pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
             max_len = max((len(s) for s in sequences), default=1)
@@ -238,3 +258,101 @@ class InternVL3_5_KTH(InternVL3):
 
         # Route the HF chat path's LLM decode through vLLM.
         self._model.language_model.generate = _vllm_generate
+
+    def generate_until(self, requests):
+        """Batch single-image / text requests through ``model.batch_chat`` so vLLM
+        decodes ``gen_batch`` sequences at once. With ``gen_batch == 1`` (default)
+        or non-image modalities this defers entirely to the unchanged parent path.
+
+        Only requests with exactly one image and at most one ``<image>`` tag are
+        grouped; multi-image / interleaved / mismatched-tag requests go one at a
+        time through the parent ``generate_until`` (``batch_chat`` only substitutes
+        a single image group per question). Requests are grouped by identical
+        generation kwargs so a batch shares ``max_new_tokens``.
+        """
+        if self._gen_batch <= 1 or self.modality != "image":
+            return super().generate_until(requests)
+
+        from lmms_eval.models.simple import internvl3 as _iv3
+
+        res = [None] * len(requests)
+        pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
+        pending = []          # (idx, pixel_values_i, num_patches_i, question)
+        pending_key = None    # generation-kwargs signature shared by the group
+
+        def _flush():
+            nonlocal pending, pending_key
+            if not pending:
+                return
+            idxs = [p[0] for p in pending]
+            pixel_values = torch.cat([p[1] for p in pending], dim=0)
+            num_patches_list = [p[2] for p in pending]
+            questions = [p[3] for p in pending]
+            responses = self.model.batch_chat(
+                self.tokenizer,
+                pixel_values,
+                questions,
+                dict(pending_key),
+                num_patches_list=num_patches_list,
+                history=None,
+                return_history=False,
+            )
+            for i, r in zip(idxs, responses):
+                res[i] = r
+                pbar.update(1)
+            pending = []
+            pending_key = None
+
+        for idx, reg in enumerate(requests):
+            contexts, gen_kwargs, doc_to_visual, doc_id, task, split = reg.args
+            gen_kwargs = dict(gen_kwargs)
+            gen_kwargs.pop("until", None)
+            for k, v in _iv3.DEFAULT_GEN_KWARGS.items():
+                gen_kwargs.setdefault(k, v)
+            for k in [k for k in gen_kwargs if k not in _iv3.DEFAULT_GEN_KWARGS]:
+                gen_kwargs.pop(k)
+
+            visuals = self.flatten([doc_to_visual(self.task_dict[task][split][doc_id])])
+            image_num = len(visuals)
+
+            # batch_chat substitutes one image group per question, so only single
+            # image + at most one tag is safe; everything else uses the parent path.
+            if image_num != 1 or contexts.count("<image>") > 1:
+                _flush()
+                res[idx] = super().generate_until([reg])[0]
+                pbar.update(1)
+                continue
+
+            dynamic_max_num = max(1, min(self.max_num, self.total_max_num // image_num))
+            pv = torch.cat(
+                [_iv3.load_image(v, max_num=dynamic_max_num).to(torch.bfloat16).to(self._device) for v in visuals],
+                dim=0,
+            )
+
+            key = tuple(sorted(gen_kwargs.items()))
+            if pending and (key != pending_key or len(pending) >= self._gen_batch):
+                _flush()
+            pending_key = key
+            pending.append((idx, pv, pv.size(0), contexts))
+            if len(pending) >= self._gen_batch:
+                _flush()
+
+        _flush()
+        pbar.close()
+        return res
+
+    def flatten(self, input):
+        """Flatten nested visuals, skipping ``None`` entries.
+
+        The base ``InternVL3.flatten`` does ``for i in input: for j in i``, which
+        raises ``TypeError`` on text-only tasks (e.g. ``scibench``) where
+        ``doc_to_visual`` returns ``None``. Guarding here lets such tasks fall
+        through to the no-image (text-only) path in ``generate_until``.
+        """
+        new_list = []
+        for i in input:
+            if i is None:
+                continue
+            for j in i:
+                new_list.append(j)
+        return new_list
