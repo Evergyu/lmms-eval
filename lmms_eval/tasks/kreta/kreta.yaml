@@ -1,0 +1,25 @@
+dataset_path: tabtoyou/KoTextVQA
+dataset_kwargs:
+  token: True
+task: "kreta"
+test_split: test
+output_type: generate_until
+doc_to_visual: !function utils.kreta_doc_to_visual
+doc_to_text: !function utils.kreta_doc_to_text
+doc_to_target: "answer"
+generation_kwargs:
+  max_new_tokens: 300
+  image_aspect_ratio: original
+process_results: !function utils.kreta_process_results
+metric_list:
+  - metric: kreta_acc
+    aggregation: !function utils.kreta_agg_all
+    higher_is_better: true
+  - metric: kreta_system1
+    aggregation: !function utils.kreta_agg_system1
+    higher_is_better: true
+  - metric: kreta_system2
+    aggregation: !function utils.kreta_agg_system2
+    higher_is_better: true
+metadata:
+  - version: 0.0
