@@ -271,84 +271,129 @@ class InternVL3_5_KTH(InternVL3):
         self._model.language_model.generate = _vllm_generate
 
     def generate_until(self, requests):
-        """Batch single-image / text requests through ``model.batch_chat`` so vLLM
-        decodes ``gen_batch`` sequences at once. With ``gen_batch == 1`` (default)
-        or non-image modalities this defers entirely to the unchanged parent path.
+        """Decode ``gen_batch`` requests per vLLM call through one unified path.
 
-        Only requests with exactly one image and at most one ``<image>`` tag are
-        grouped; multi-image / interleaved / mismatched-tag requests go one at a
-        time through the parent ``generate_until`` (``batch_chat`` only substitutes
-        a single image group per question). Requests are grouped by identical
-        generation kwargs so a batch shares ``max_new_tokens``.
+        Builds each prompt exactly like ``model.chat`` (same conv template and the
+        same per-image ``<image>`` -> image-token substitution driven by each
+        image's tile count), so single-image, multi-image and text-only requests
+        all batch the same way -- no per-request fallback, one progress bar, one
+        logging path. Requests are grouped by (has-image, generation kwargs) so a
+        batch shares image-presence and ``max_new_tokens``.
+
+        ``gen_batch == 1`` (default) or non-image modalities defer to the unchanged
+        parent path. Pair ``gen_batch > 1`` with ``VLLM_BATCH_INVARIANT=1`` to get
+        outputs identical to the sequential path regardless of batch size.
         """
         if self._gen_batch <= 1 or self.modality != "image":
             return super().generate_until(requests)
 
+        import sys
+
         from lmms_eval.models.simple import internvl3 as _iv3
+
+        model = self.model
+        tok = self.tokenizer
+        get_conv_template = sys.modules[type(model).__module__].get_conv_template
+        IMG_START, IMG_END, IMG_CTX = "<img>", "</img>", "<IMG_CONTEXT>"
+        sep = get_conv_template(model.template).sep.strip()
+        model.img_context_token_id = tok.convert_tokens_to_ids(IMG_CTX)
+
+        def _norm_gk(gen_kwargs):
+            gk = dict(gen_kwargs)
+            gk.pop("until", None)
+            for k, v in _iv3.DEFAULT_GEN_KWARGS.items():
+                gk.setdefault(k, v)
+            for k in [k for k in gk if k not in _iv3.DEFAULT_GEN_KWARGS]:
+                gk.pop(k)
+            return gk
+
+        def _build(contexts, visuals):
+            """Replicate model.chat prompt building. Returns (query, pixel_values)."""
+            n = len(visuals)
+            processed = []
+            if n == 0:
+                question = contexts
+            else:
+                dyn = max(1, min(self.max_num, self.total_max_num // n))
+                processed = [
+                    _iv3.load_image(v, max_num=dyn).to(torch.bfloat16).to(self._device) for v in visuals
+                ]
+                # Match parent: keep author-interleaved tags, else prepend one per image.
+                question = contexts if contexts.count("<image>") == n else " ".join(["<image>"] * n) + "\n" + contexts
+            template = get_conv_template(model.template)
+            template.system_message = model.system_message
+            template.append_message(template.roles[0], question)
+            template.append_message(template.roles[1], None)
+            query = template.get_prompt()
+            for p in processed:  # one <image> -> one image's token block, in order
+                block = IMG_START + IMG_CTX * model.num_image_token * p.size(0) + IMG_END
+                query = query.replace("<image>", block, 1)
+            pv = torch.cat(processed, dim=0) if processed else None
+            return query, pv
 
         res = [None] * len(requests)
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
-        pending = []          # (idx, pixel_values_i, num_patches_i, question)
-        pending_key = None    # generation-kwargs signature shared by the group
 
-        def _flush():
-            nonlocal pending, pending_key
-            if not pending:
-                return
-            idxs = [p[0] for p in pending]
-            pixel_values = torch.cat([p[1] for p in pending], dim=0)
-            num_patches_list = [p[2] for p in pending]
-            questions = [p[3] for p in pending]
-            responses = self.model.batch_chat(
-                self.tokenizer,
-                pixel_values,
-                questions,
-                dict(pending_key),
-                num_patches_list=num_patches_list,
-                history=None,
-                return_history=False,
-            )
-            for i, r in zip(idxs, responses):
-                res[i] = r
+        def _run(chunk):
+            gk = dict(chunk[0][3])
+            gk["eos_token_id"] = tok.convert_tokens_to_ids(sep)
+            tok.padding_side = "left"
+            enc = tok([c[1] for c in chunk], return_tensors="pt", padding=True)
+            input_ids = enc["input_ids"].to(self._device)
+            attn = enc["attention_mask"].to(self._device)
+            pvs = [c[2] for c in chunk]
+            pixel_values = torch.cat(pvs, dim=0) if pvs[0] is not None else None
+            out = model.generate(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attn, **gk)
+            for c, r in zip(chunk, tok.batch_decode(out, skip_special_tokens=True)):
+                res[c[0]] = r.split(sep)[0].strip()
                 pbar.update(1)
-            pending = []
-            pending_key = None
 
-        for idx, reg in enumerate(requests):
+        # Prompt/image building (CPU-side InternVL dynamic tiling: PIL resize of up to
+        # ~12 tiles per image) is the real bottleneck — it runs while the GPU sits idle.
+        # Build prompts in parallel worker threads with a bounded look-ahead queue so
+        # CPU preprocessing of upcoming requests overlaps GPU decode of the current
+        # batch. Building is deterministic, so per-request outputs are unchanged; only
+        # the scheduling differs. PREP_WORKERS / PREP_PREFETCH tune it.
+        def _build_one(item):
+            idx, reg = item
             contexts, gen_kwargs, doc_to_visual, doc_id, task, split = reg.args
-            gen_kwargs = dict(gen_kwargs)
-            gen_kwargs.pop("until", None)
-            for k, v in _iv3.DEFAULT_GEN_KWARGS.items():
-                gen_kwargs.setdefault(k, v)
-            for k in [k for k in gen_kwargs if k not in _iv3.DEFAULT_GEN_KWARGS]:
-                gen_kwargs.pop(k)
-
+            gk = _norm_gk(gen_kwargs)
             visuals = self.flatten([doc_to_visual(self.task_dict[task][split][doc_id])])
-            image_num = len(visuals)
+            query, pv = _build(contexts, visuals)
+            key = (pv is not None, tuple(sorted(gk.items())))
+            return idx, query, pv, gk, key
 
-            # batch_chat substitutes one image group per question, so only single
-            # image + at most one tag is safe; everything else uses the parent path.
-            if image_num != 1 or contexts.count("<image>") > 1:
-                _flush()
-                res[idx] = super().generate_until([reg])[0]
-                pbar.update(1)
-                continue
+        import itertools
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
 
-            dynamic_max_num = max(1, min(self.max_num, self.total_max_num // image_num))
-            pv = torch.cat(
-                [_iv3.load_image(v, max_num=dynamic_max_num).to(torch.bfloat16).to(self._device) for v in visuals],
-                dim=0,
-            )
+        nworkers = max(1, int(os.environ.get("PREP_WORKERS", "8")))
+        prefetch = max(self._gen_batch * 2, int(os.environ.get("PREP_PREFETCH", str(self._gen_batch * 3))))
 
-            key = tuple(sorted(gen_kwargs.items()))
-            if pending and (key != pending_key or len(pending) >= self._gen_batch):
-                _flush()
-            pending_key = key
-            pending.append((idx, pv, pv.size(0), contexts))
-            if len(pending) >= self._gen_batch:
-                _flush()
+        def _built_stream(ex):
+            futs = deque()
+            it = iter(enumerate(requests))
+            for x in itertools.islice(it, prefetch):
+                futs.append(ex.submit(_build_one, x))
+            for x in it:
+                yield futs.popleft().result()
+                futs.append(ex.submit(_build_one, x))
+            while futs:
+                yield futs.popleft().result()
 
-        _flush()
+        cur, cur_key = [], None
+        with ThreadPoolExecutor(max_workers=nworkers) as ex:
+            for idx, query, pv, gk, key in _built_stream(ex):
+                if cur and (key != cur_key or len(cur) >= self._gen_batch):
+                    _run(cur)
+                    cur = []
+                cur_key = key
+                cur.append((idx, query, pv, gk))
+                if len(cur) >= self._gen_batch:
+                    _run(cur)
+                    cur = []
+            if cur:
+                _run(cur)
         pbar.close()
         return res
 
