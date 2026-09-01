@@ -143,6 +143,11 @@ def _score_int(groundtruth: Any, prediction: Any) -> float:
     pred_num = _extract_first_number(prediction)
     if gt_num is None or pred_num is None:
         return 0.0
+    # 2026-08-26: 모델이 자릿수가 폭주한 숫자를 뱉으면 float 로 inf/nan 이 되고
+    # int() 가 OverflowError 로 평가 전체를 죽인다(KTH baseline 에서 실측).
+    # 유한하지 않은 예측은 그냥 오답이다 - 채점기가 죽을 일이 아니다.
+    if not (math.isfinite(gt_num) and math.isfinite(pred_num)):
+        return 0.0
     return float(int(gt_num) == int(pred_num))
 
 
@@ -204,6 +209,26 @@ def _download_pdf(doc_id: str) -> str:
     )
 
 
+def _cap_page_px(img):
+    """MMLB_MAX_PAGE_PX env 설정 시 긴 변을 그 픽셀로 다운스케일 (미설정=기존 동작 그대로).
+
+    evidence 페이지가 크면 vLLM InternVL 동적타일이 페이지당 12타일까지 붙어
+    일부 문항에서 프롬프트가 max_model_len(40960)을 초과해 런 전체가 죽는다.
+    기본 동작(공용 public_eval 프로토콜)은 불변; 필요 시 env 로만 제한."""
+    import os as _os
+
+    cap = _os.environ.get("MMLB_MAX_PAGE_PX")
+    if not cap or img is None:
+        return img
+    cap = int(cap)
+    if max(img.size) <= cap:
+        return img
+    w, h = img.size
+    if w >= h:
+        return img.resize((cap, max(1, int(h * cap / w))))
+    return img.resize((max(1, int(w * cap / h)), cap))
+
+
 def _render_page_fitz(pdf_path: str, page_number: int):
     """Render a PDF page using PyMuPDF (no system deps)."""
     from PIL import Image
@@ -216,7 +241,7 @@ def _render_page_fitz(pdf_path: str, page_number: int):
     pix = page.get_pixmap(dpi=144)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     doc.close()
-    return img
+    return _cap_page_px(img)
 
 
 def _render_page_pdf2image(pdf_path: str, page_number: int):
@@ -224,7 +249,7 @@ def _render_page_pdf2image(pdf_path: str, page_number: int):
     images = convert_from_path(pdf_path, first_page=page_number, last_page=page_number, dpi=144)
     if not images:
         return None
-    return images[0].convert("RGB")
+    return _cap_page_px(images[0].convert("RGB"))
 
 
 def _render_page(doc_id: str, page_number: int):
@@ -277,6 +302,16 @@ def mmlongbench_doc_to_visual(doc):
     pages = _parse_page_numbers(doc.get("evidence_pages"))
     if not pages:
         return []
+
+    # MMLB_MAX_PAGES env 설정 시 evidence 페이지 수 상한 (균등 서브샘플, 미설정=기존 동작).
+    # 일부 극단 문항(evidence 13페이지+)이 40960 컨텍스트를 넘겨 vLLM 런 전체가 죽는 것 방지.
+    import os as _os
+
+    _cap = _os.environ.get("MMLB_MAX_PAGES")
+    if _cap and len(pages) > int(_cap):
+        _n = int(_cap)
+        _idx = sorted({round(i * (len(pages) - 1) / (_n - 1)) for i in range(_n)})
+        pages = [pages[i] for i in _idx]
 
     if not _HAS_PDF_RENDERER:
         if not _WARNED_MISSING_PDF_RENDERER:

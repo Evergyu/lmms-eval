@@ -150,6 +150,7 @@ def prismm_doc_to_text(doc, lmms_eval_specific_kwargs=None):
         "post_prompt",
         "\nOutput only a single letter corresponding to the correct answer. Do not output any explanation or text of the question again.",
     )
+    post_prompt = _os.environ.get("PRISMM_POST_PROMPT", post_prompt)  # 추론프롬프트 실험 오버라이드(미설정시 기존동작)
 
     if context:
         full_text = f"{pre_prompt}\n{context}\n\n{question}\n{choices_str}{post_prompt}"
@@ -185,6 +186,7 @@ def _prismm_doc_to_messages_generic(doc, lmms_eval_specific_kwargs, visual_fn, s
 
     pre_prompt = lmms_eval_specific_kwargs.get("pre_prompt", "")
     post_prompt = lmms_eval_specific_kwargs.get("post_prompt", "")
+    post_prompt = _os.environ.get("PRISMM_POST_PROMPT", post_prompt)  # 추론프롬프트 실험 오버라이드(미설정시 기존동작)
 
     visuals = visual_fn(doc)
 
@@ -279,6 +281,7 @@ def prismm_edit_doc_to_text(doc, lmms_eval_specific_kwargs=None):
 
     pre_prompt = lmms_eval_specific_kwargs.get("pre_prompt", "")
     post_prompt = lmms_eval_specific_kwargs.get("post_prompt", "")
+    post_prompt = _os.environ.get("PRISMM_POST_PROMPT", post_prompt)  # 추론프롬프트 실험 오버라이드(remedy)
 
     if context:
         full_text = f"{pre_prompt}\n{context}\n\n{question}\n{choices_str}{post_prompt}"
@@ -323,6 +326,7 @@ def _prismm_edit_doc_to_messages_generic(doc, lmms_eval_specific_kwargs, visual_
 
     pre_prompt = lmms_eval_specific_kwargs.get("pre_prompt", "")
     post_prompt = lmms_eval_specific_kwargs.get("post_prompt", "")
+    post_prompt = _os.environ.get("PRISMM_POST_PROMPT", post_prompt)  # 추론프롬프트 실험 오버라이드(미설정시 기존동작)
 
     visuals = visual_fn(doc)
 
@@ -419,6 +423,7 @@ def prismm_pair_match_doc_to_text(doc, lmms_eval_specific_kwargs=None):
 
     pre_prompt = lmms_eval_specific_kwargs.get("pre_prompt", "")
     post_prompt = lmms_eval_specific_kwargs.get("post_prompt", "")
+    post_prompt = _os.environ.get("PRISMM_POST_PROMPT", post_prompt)  # 추론프롬프트 실험 오버라이드(pair_match text)
 
     intro = "You are provided with a part of a scientific paper:"
     if task.get("query_type") == "text":
@@ -456,6 +461,7 @@ def prismm_pair_match_doc_to_messages(doc, lmms_eval_specific_kwargs=None):
 
     pre_prompt = lmms_eval_specific_kwargs.get("pre_prompt", "")
     post_prompt = lmms_eval_specific_kwargs.get("post_prompt", "")
+    post_prompt = _os.environ.get("PRISMM_POST_PROMPT", post_prompt)  # 추론프롬프트 실험 오버라이드(pair_match msg)
 
     if pre_prompt:
         messages[0]["content"].append({"type": "text", "text": pre_prompt})
